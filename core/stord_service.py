@@ -1,6 +1,7 @@
 import requests
 import json
 import math
+import asyncio
 from typing import Optional, Dict, Any
 
 from collections import OrderedDict
@@ -247,6 +248,46 @@ class StordService:
             logger.error(f"Unexpected error fetching Stord order {order_id}: {e}")
             raise
 
+    async def get_inventory_from_stord_api(self, sku: str) -> int:
+        """
+        Fetches the total on-hand inventory for a given SKU from the Stord API.
+        Returns 0 if the SKU is not found or an error occurs.
+        """
+        def _fetch():
+            logger.info(f"Fetching Stord inventory for SKU: {sku}")
+            url = (
+                f"{self.base_url}/organizations/{self.org_id}/oms/networks/{self.network_id}/inventory/reports/network"
+            )
+            headers = {"Authorization": f"Bearer {self.api_token}"}
+            params = {"search": sku}
+
+            try:
+                response = requests.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                response_data = response.json()
+
+                if response_data and response_data.get("data"):
+                    item = response_data["data"][0]
+                    total_on_hand_str = item.get("network_balances", {}).get("total_on_hand", "0.00000")
+                    total_on_hand = int(float(total_on_hand_str))
+                    logger.info(f"Stord inventory for SKU {sku}: {total_on_hand}")
+                    return total_on_hand
+                else:
+                    logger.info(f"Stord inventory for SKU {sku} not found in API response.")
+                    return 0
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching Stord inventory for SKU {sku}: {e}")
+                return 0
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected response format for Stord inventory for SKU {sku}: {e}")
+                return 0
+            except Exception as e:
+                logger.error(f"An unexpected error occurred while fetching Stord inventory for SKU {sku}: {e}")
+                return 0
+        
+        return await asyncio.to_thread(_fetch)
+
+
 if __name__ == "__main__":
     stord_service = StordService()
     # Example usage: fetching sales orders (without saving to file)
@@ -271,3 +312,11 @@ if __name__ == "__main__":
             print(f"Stord Order {test_order_id} not found.")
     except Exception as e:
         print(f"Error during test fetch for Stord Order {test_order_id}: {e}")
+
+    # Example usage: fetching inventory by SKU
+    test_sku = "TCT4000SEABRZXL" # Replace with a real SKU for testing
+    try:
+        inventory = stord_service.get_inventory_from_stord_api(test_sku)
+        print(f"Stord Inventory for SKU {test_sku}: {inventory}")
+    except Exception as e:
+        print(f"Error during test fetch for Stord Inventory {test_sku}: {e}")

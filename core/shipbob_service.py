@@ -2,6 +2,7 @@ import csv
 import requests
 import json
 import dotenv
+import asyncio
 from typing import Optional, Dict, Any
 
 from core.logger import get_logger
@@ -189,6 +190,55 @@ class ShipbobService:
             raise
 
 
+    async def get_inventory_from_shipbob_api(self, sku: str) -> tuple[int, int]:
+        """
+        Fetches inventory for a given SKU from the Shipbob API, separating Fontana (ID 250)
+        stock from other locations. Returns (fontana_stock, other_stock).
+        Returns (0, 0) if the SKU is not found or an error occurs.
+        """
+        def _fetch():
+            logger.info(f"SHIPBOB INVENTORY DEBUG: Requesting inventory for SKU: '{sku}'")
+            url = f"{self.base_url}/inventory-level/locations"
+            headers = {"Authorization": f"Bearer {self.api_token}"}
+            params = {"SearchBy": sku}
+
+            fontana_stock = 0
+            other_stock = 0
+
+            try:
+                response = requests.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                response_data = response.json()
+                logger.info(f"SHIPBOB INVENTORY DEBUG: Raw API response for SKU '{sku}': {response_data}")
+
+                if response_data and response_data.get("items"):
+                    item = response_data["items"][0]
+                    locations = item.get("locations", [])
+
+                    for location in locations:
+                        on_hand = location.get("on_hand_quantity", 0)
+                        if location.get("location_id") == 250:
+                            fontana_stock += on_hand
+                        else:
+                            other_stock += on_hand
+                    logger.info(f"Shipbob inventory for SKU {sku}: Fontana={fontana_stock}, Other={other_stock}")
+                    return fontana_stock, other_stock
+                else:
+                    logger.info(f"Shipbob inventory for SKU {sku} not found in API response.")
+                    return 0, 0
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching Shipbob inventory for SKU {sku}: {e}")
+                return 0, 0
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected response format for Shipbob inventory for SKU {sku}: {e}")
+                return 0, 0
+            except Exception as e:
+                logger.error(f"An unexpected error occurred while fetching Shipbob inventory for SKU {sku}: {e}")
+                return 0, 0
+        
+        return await asyncio.to_thread(_fetch)
+
+
 if __name__ == "__main__":
     shipbob_service = ShipbobService()
     orders = shipbob_service.get_orders(
@@ -208,3 +258,11 @@ if __name__ == "__main__":
             print(f"Shipbob Order {test_order_id} not found.")
     except Exception as e:
         print(f"Error during test fetch for Shipbob Order {test_order_id}: {e}")
+
+    # Example usage: fetching inventory by SKU
+    test_sku = "TCT4000SEPIAWDL" # Replace with a real SKU for testing
+    try:
+        fontana_stock, other_stock = shipbob_service.get_inventory_from_shipbob_api(test_sku)
+        print(f"Shipbob Inventory for SKU {test_sku}: Fontana={fontana_stock}, Other={other_stock}")
+    except Exception as e:
+        print(f"Error during test fetch for Shipbob Inventory {test_sku}: {e}")

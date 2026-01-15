@@ -9,6 +9,13 @@ logger = get_logger(__name__)
 
 # --- Pydantic Models ---
 
+class SkuInventory(BaseModel):
+    sku: str
+    stord_stock: int
+    shipbob_fontana_stock: int
+    shipbob_other_stock: int
+
+
 class OutOfStockSKU(BaseModel):
     sku: str
     count_affected_orders: int
@@ -97,7 +104,6 @@ def convert_shipbob_order_to_model(order_data: Dict[str, Any], include_raw: bool
                 quantity=product_item.get("quantity"),
                 status=shipment.get("status") # Using shipment status as line status for now
             ))
-
     recipient = order_data.get("recipient", {})
     customer_name = recipient.get("name")
     customer_email = recipient.get("email")
