@@ -25,8 +25,10 @@ STORD_BASE_URL = os.getenv("STORD_BASE_URL")
 STORD_API_TOKEN = os.getenv("STORD_API_TOKEN")
 STORD_ORG_ID = os.getenv("STORD_ORG_ID")
 STORD_NETWORK_ID = os.getenv("STORD_NETWORK_ID")
-STORD_CHANNEL_IDS = os.getenv("STORD_CHANNEL_IDS").split(",")
-STORD_STATUS = os.getenv("STORD_STATUS").split(",")
+channel_ids_str = os.getenv("STORD_CHANNEL_IDS")
+STORD_CHANNEL_IDS = channel_ids_str.split(",") if channel_ids_str else []
+status_str = os.getenv("STORD_STATUS")
+STORD_STATUS = status_str.split(",") if status_str else []
 
 # ============================================================================
 # Shipbob API Configuration

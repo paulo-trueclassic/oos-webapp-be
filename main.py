@@ -18,7 +18,7 @@ import asyncio  # Added for concurrent API calls
 
 from core.logger import get_logger
 from core.config import APP_USERNAME, APP_PASSWORD
-from core.bigquery_service import bigquery_service
+from core.bigquery_service import bigquery_service, BigQueryClientError
 from core.background_tasks import trigger_full_refresh
 from core.data_models import (
     OrderDetails,
@@ -207,7 +207,13 @@ async def get_oos_orders(
             detail="Invalid source specified. Must be 'stord' or 'shipbob'.",
         )
 
-    raw_orders_data = bigquery_service.get_oos_orders(source=source.lower())
+    try:
+        raw_orders_data = bigquery_service.get_oos_orders(source=source.lower())
+    except BigQueryClientError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"BigQuery service unavailable: {str(e)}. Please check your BigQuery credentials configuration.",
+        )
 
     # Convert raw data to OrderDetails models for consistent frontend consumption
     converted_orders = []
@@ -244,9 +250,15 @@ async def get_order_details(
             detail="Invalid source specified. Must be 'stord' or 'shipbob'.",
         )
 
-    raw_order_data = bigquery_service.get_order_details(
-        order_id=order_id, source=source.lower()
-    )
+    try:
+        raw_order_data = bigquery_service.get_order_details(
+            order_id=order_id, source=source.lower()
+        )
+    except BigQueryClientError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"BigQuery service unavailable: {str(e)}. Please check your BigQuery credentials configuration.",
+        )
 
     if not raw_order_data:
         raise HTTPException(
@@ -283,11 +295,17 @@ async def get_last_refresh_time(
     """
     Retrieves the most recent timestamp of a data refresh.
     """
-    last_refresh = bigquery_service.get_last_refresh_time()
-    if last_refresh:
-        return {"last_refresh_time": last_refresh.isoformat()}
-    else:
-        raise HTTPException(status_code=404, detail="Refresh time not available.")
+    try:
+        last_refresh = bigquery_service.get_last_refresh_time()
+        if last_refresh:
+            return {"last_refresh_time": last_refresh.isoformat()}
+        else:
+            raise HTTPException(status_code=404, detail="Refresh time not available.")
+    except BigQueryClientError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"BigQuery service unavailable: {str(e)}. Please check your BigQuery credentials configuration.",
+        )
 
 
 @app.post("/api/inventory/bulk", response_model=Dict[str, SkuInventory])
