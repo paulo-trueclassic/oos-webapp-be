@@ -5,8 +5,12 @@ import dotenv
 import asyncio
 from typing import Optional, Dict, Any
 
-from core.logger import get_logger
-from core.config import SHIPBOB_BASE_URL, SHIPBOB_API_TOKEN
+try:
+    from core.logger import get_logger
+    from core.config import SHIPBOB_BASE_URL, SHIPBOB_API_TOKEN
+except ModuleNotFoundError:
+    from logger import get_logger
+    from config import SHIPBOB_BASE_URL, SHIPBOB_API_TOKEN
 
 dotenv.load_dotenv()
 logger = get_logger(__name__)
@@ -56,7 +60,7 @@ class ShipbobService:
         self,
         single_page: bool = False,
         limit: int = 250,
-        max_pages: int = 100,
+        max_pages: int = 25,
         has_tracking: bool = False,
     ):
         logger.info(
@@ -168,6 +172,7 @@ class ShipbobService:
 
         logger.info(f"Exception orders: {len(output)} items")
         return output
+        return output
 
     def get_order_by_id(self, order_id: str) -> Optional[Dict[str, Any]]:
         """Fetches a single Shipbob order by its ID directly from the API."""
@@ -241,28 +246,6 @@ class ShipbobService:
 
 if __name__ == "__main__":
     shipbob_service = ShipbobService()
-    orders = shipbob_service.get_orders(
-        single_page=True, limit=10
-    )
-    filtered_orders = shipbob_service._filter_oos_orders(orders, save_to_file=False)
-    logger.info(f"Filtered orders: {len(filtered_orders)} items")
-
-    # Example usage: fetching a single order by ID
-    # Replace with a real Shipbob Order ID for testing
-    test_order_id = "a_shipbob_order_id_for_testing"
-    try:
-        order_detail = shipbob_service.get_order_by_id(test_order_id)
-        if order_detail:
-            print(f"Fetched Shipbob Order {test_order_id}: {json.dumps(order_detail, indent=2)}")
-        else:
-            print(f"Shipbob Order {test_order_id} not found.")
-    except Exception as e:
-        print(f"Error during test fetch for Shipbob Order {test_order_id}: {e}")
-
-    # Example usage: fetching inventory by SKU
-    test_sku = "TCT4000SEPIAWDL" # Replace with a real SKU for testing
-    try:
-        fontana_stock, other_stock = shipbob_service.get_inventory_from_shipbob_api(test_sku)
-        print(f"Shipbob Inventory for SKU {test_sku}: Fontana={fontana_stock}, Other={other_stock}")
-    except Exception as e:
-        print(f"Error during test fetch for Shipbob Inventory {test_sku}: {e}")
+    shipbob_raw_orders = shipbob_service.get_orders(
+            single_page=False, limit=250, max_pages=25
+        )

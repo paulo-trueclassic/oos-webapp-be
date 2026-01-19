@@ -19,7 +19,7 @@ import asyncio  # Added for concurrent API calls
 from core.logger import get_logger
 from core.config import APP_USERNAME, APP_PASSWORD
 from core.bigquery_service import bigquery_service, BigQueryClientError
-from core.background_tasks import trigger_full_refresh
+from core.background_tasks import trigger_full_refresh, trigger_source_refresh
 from core.data_models import (
     OrderDetails,
     convert_stord_order_to_model,
@@ -219,11 +219,13 @@ async def get_oos_orders(
     converted_orders = []
     for item in raw_orders_data:
         if source.lower() == "stord":
-            converted_orders.append(
+            # The conversion function now returns a list, so we extend the main list
+            converted_orders.extend(
                 convert_stord_order_to_model(item, include_raw=True)
             )
         else:  # shipbob
-            converted_orders.append(
+            # The conversion function now returns a list, so we extend the main list
+            converted_orders.extend(
                 convert_shipbob_order_to_model(item, include_raw=True)
             )
 
@@ -274,7 +276,7 @@ async def get_order_details(
 
 @app.post("/api/trigger-refresh", status_code=status.HTTP_202_ACCEPTED)
 @limiter.limit("100/minute")
-async def trigger_refresh(
+async def trigger_full_refresh_endpoint(
     request: Request,
     background_tasks: BackgroundTasks,
     credentials: HTTPBasicCredentials = Depends(verify_credentials),
@@ -283,8 +285,28 @@ async def trigger_refresh(
     Triggers a full refresh of Stord and Shipbob OOS data in the background.
     """
     background_tasks.add_task(trigger_full_refresh)
-    logger.info("Data refresh task added to background.")
-    return {"message": "Data refresh initiated in the background."}
+    logger.info("Full data refresh task added to background.")
+    return {"message": "Full data refresh initiated in the background."}
+
+
+@app.post("/api/trigger-refresh/{source}", status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit("100/minute")
+async def trigger_source_refresh_endpoint(
+    request: Request,
+    source: str,
+    background_tasks: BackgroundTasks,
+    credentials: HTTPBasicCredentials = Depends(verify_credentials),
+):
+    """
+    Triggers a refresh of OOS data for a single source ('stord' or 'shipbob') in the background.
+    """
+    source = source.lower()
+    if source not in ["stord", "shipbob"]:
+        raise HTTPException(status_code=400, detail="Invalid source specified. Must be 'stord' or 'shipbob'.")
+    
+    background_tasks.add_task(trigger_source_refresh, source)
+    logger.info(f"Data refresh task for source '{source}' added to background.")
+    return {"message": f"Data refresh for source '{source}' initiated in the background."}
 
 
 @app.get("/api/last-refresh-time")
@@ -314,12 +336,13 @@ async def get_bulk_inventory(
     request: Request, credentials: HTTPBasicCredentials = Depends(verify_credentials)
 ):
     """
-    Fetches live inventory data for a list of SKUs from Stord and Shipbob APIs concurrently.
+    Fetches live inventory data for a list of SKUs from Stord and Shipbob APIs concurrently,
+    processing in batches to respect API rate limits.
     """
     try:
         request_body = await request.json()
         skus = list(set(request_body.get("skus", [])))  # Deduplicate SKUs
-        logger.info(f"--- INVENTORY DEBUG: Received SKUs for bulk inventory check: {skus} ---")
+        logger.info(f"--- INVENTORY DEBUG: Received {len(skus)} SKUs for bulk inventory check ---")
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
@@ -327,29 +350,47 @@ async def get_bulk_inventory(
         return {}
 
     inventory_results = {}
-    tasks = []
+    batch_size = 100  # Process 100 SKUs at a time (200 total API calls)
+    
+    for i in range(0, len(skus), batch_size):
+        batch_skus = skus[i:i + batch_size]
+        logger.info(f"Processing inventory batch {i//batch_size + 1} with {len(batch_skus)} SKUs.")
+        
+        tasks = []
+        for sku in batch_skus:
+            tasks.append(stord_service.get_inventory_from_stord_api(sku))
+            tasks.append(shipbob_service.get_inventory_from_shipbob_api(sku))
 
-    for sku in skus:
-        tasks.append(stord_service.get_inventory_from_stord_api(sku))
-        tasks.append(shipbob_service.get_inventory_from_shipbob_api(sku))
+        # Run all API calls for the current batch concurrently
+        batch_api_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Run all API calls concurrently
-    all_results = await asyncio.gather(*tasks)
+        # Process results and group them by SKU
+        for j, sku in enumerate(batch_skus):
+            stord_result = batch_api_results[j*2]
+            shipbob_result = batch_api_results[j*2+1]
 
-    # Process results and group them by SKU
-    for i in range(0, len(skus)):
-        current_sku = skus[i]
-        stord_stock = all_results[i*2]
-        shipbob_fontana_stock, shipbob_other_stock = all_results[i*2+1]
+            stord_stock = stord_result if not isinstance(stord_result, Exception) else 0
+            if isinstance(stord_result, Exception):
+                logger.error(f"Error fetching Stord inventory for SKU {sku}: {stord_result}")
 
-        current_sku_normalized = current_sku.strip().lower()
-        inventory_results[current_sku_normalized] = SkuInventory(
-            sku=current_sku,
-            stord_stock=stord_stock,
-            shipbob_fontana_stock=shipbob_fontana_stock,
-            shipbob_other_stock=shipbob_other_stock
-        )
+            shipbob_fontana_stock, shipbob_other_stock = shipbob_result if not isinstance(shipbob_result, Exception) else (0, 0)
+            if isinstance(shipbob_result, Exception):
+                logger.error(f"Error fetching Shipbob inventory for SKU {sku}: {shipbob_result}")
 
+            current_sku_normalized = sku.strip().lower()
+            inventory_results[current_sku_normalized] = SkuInventory(
+                sku=sku,
+                stord_stock=stord_stock,
+                shipbob_fontana_stock=shipbob_fontana_stock,
+                shipbob_other_stock=shipbob_other_stock
+            )
+            
+        # If there are more batches to process, wait for 60 seconds before the next one
+        if i + batch_size < len(skus):
+            logger.info(f"Batch {i//batch_size + 1} complete. Waiting 60 seconds to respect rate limits.")
+            await asyncio.sleep(60)
+
+    logger.info("All inventory batches processed successfully.")
     return inventory_results
 
 

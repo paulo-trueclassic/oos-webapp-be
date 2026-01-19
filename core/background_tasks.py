@@ -32,14 +32,18 @@ def process_stord_data():
 
         stord_filtered_oos_orders: List[Dict[str, Any]] = []
         for order_data in stord_raw_orders:
-            # Use the conversion logic to identify OOS, but we only need the raw data for BigQuery
-            model_order = convert_stord_order_to_model(order_data) 
+            # The conversion function returns a list with a single order model.
+            model_order_list = convert_stord_order_to_model(order_data)
+            if not model_order_list:
+                continue
+
+            model_order = model_order_list[0]  # Get the single order from the list
             is_oos = any(
                 line.status == "backordered"
-                for line in model_order.line_items # Use the converted model's line_items
+                for line in model_order.line_items
             )
             if is_oos:
-                stord_filtered_oos_orders.append(order_data) # Store original raw data
+                stord_filtered_oos_orders.append(order_data)  # Store original raw data
         
         logger.info(f"Found {len(stord_filtered_oos_orders)} Stord OOS orders.")
 
@@ -61,7 +65,7 @@ def process_shipbob_data():
 
     try:
         shipbob_raw_orders = shipbob_service.get_orders(
-            single_page=False, limit=250, max_pages=100
+            single_page=False, limit=250, max_pages=25
         )
         logger.info(f"Fetched {len(shipbob_raw_orders)} raw Shipbob orders.")
 
@@ -91,6 +95,23 @@ def trigger_full_refresh():
         logger.info("Full data refresh process completed.")
     except Exception as e:
         logger.error(f"Full data refresh failed: {e}", exc_info=True)
+
+
+def trigger_source_refresh(source: str):
+    """Triggers a refresh for a single source."""
+    logger.info(f"Initiating data refresh for source: {source}.")
+    try:
+        bigquery_service.create_tables_if_not_exists()
+        if source == "stord":
+            process_stord_data()
+        elif source == "shipbob":
+            process_shipbob_data()
+        else:
+            logger.warning(f"Invalid source specified for refresh: {source}")
+            return
+        logger.info(f"Data refresh for source '{source}' completed.")
+    except Exception as e:
+        logger.error(f"Data refresh for source '{source}' failed: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

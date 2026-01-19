@@ -7,15 +7,26 @@ from typing import Optional, Dict, Any
 from collections import OrderedDict
 import dotenv
 
-from core.logger import get_logger
-from core.config import (
-    STORD_BASE_URL,
-    STORD_API_TOKEN,
-    STORD_ORG_ID,
-    STORD_NETWORK_ID,
-    STORD_CHANNEL_IDS,
-    STORD_STATUS,
-)
+try:
+    from core.logger import get_logger
+    from core.config import (
+        STORD_BASE_URL,
+        STORD_API_TOKEN,
+        STORD_ORG_ID,
+        STORD_NETWORK_ID,
+        STORD_CHANNEL_IDS,
+        STORD_STATUS,
+    )
+except ModuleNotFoundError:
+    from logger import get_logger
+    from config import (
+        STORD_BASE_URL,
+        STORD_API_TOKEN,
+        STORD_ORG_ID,
+        STORD_NETWORK_ID,
+        STORD_CHANNEL_IDS,
+        STORD_STATUS,
+    )
 
 dotenv.load_dotenv()
 
@@ -154,7 +165,6 @@ class StordService:
         channel_ids: list = None,
         status: list = None,
         fields: list = None,
-        output_format: str = None,
     ):
         logger.info(f"Fetching sales orders (single_page={single_page}, limit={limit})")
 
@@ -227,16 +237,16 @@ class StordService:
         url = f"{self.base_url}/organizations/{self.org_id}/oms/networks/{self.network_id}/orders/sales"
         headers = {"Authorization": f"Bearer {self.api_token}"}
         params = {
-            "limit": 1, # We only need one order
+            "limit": 1,  # We only need one order
             "search_field": "order_id",
-            "search_term": order_id
+            "search_term": order_id,
         }
 
         try:
             response = requests.get(url, headers=headers, params=params)
             response.raise_for_status()
             response_json = response.json()
-            
+
             if response_json and response_json.get("data"):
                 # Return the first matching order's data
                 return response_json["data"][0]
@@ -250,27 +260,31 @@ class StordService:
 
     async def get_inventory_from_stord_api(self, sku: str) -> int:
         """
-        Fetches the total on-hand inventory for a given SKU from the Stord API.
+        Fetches the on-hand inventory quantity for a given SKU from the Stord API.
         Returns 0 if the SKU is not found or an error occurs.
         """
         def _fetch():
-            logger.info(f"Fetching Stord inventory for SKU: {sku}")
-            url = (
-                f"{self.base_url}/organizations/{self.org_id}/oms/networks/{self.network_id}/inventory/reports/network"
-            )
-            headers = {"Authorization": f"Bearer {self.api_token}"}
-            params = {"search": sku}
+            logger.info(f"STORD INVENTORY DEBUG: Requesting inventory for SKU: '{sku}'")
+            url = f"{self.base_url}/inventory-levels"
+            headers = {
+                "Authorization": f"Bearer {self.api_token}",
+                "Stord-Organization-Id": self.org_id,
+            }
+            params = {"sku": sku}
 
             try:
                 response = requests.get(url, headers=headers, params=params)
                 response.raise_for_status()
                 response_data = response.json()
+                logger.info(f"STORD INVENTORY DEBUG: Raw API response for SKU '{sku}': {response_data}")
 
-                if response_data and response_data.get("data"):
-                    item = response_data["data"][0]
-                    total_on_hand_str = item.get("network_balances", {}).get("total_on_hand", "0.00000")
-                    total_on_hand = int(float(total_on_hand_str))
-                    logger.info(f"Stord inventory for SKU {sku}: {total_on_hand}")
+                if response_data and response_data.get("content"):
+                    # Stord API returns a list of inventory levels for different facilities
+                    total_on_hand = sum(
+                        item.get("on_hand_quantity", 0)
+                        for item in response_data["content"]
+                    )
+                    logger.info(f"Stord inventory for SKU {sku}: Total On Hand={total_on_hand}")
                     return total_on_hand
                 else:
                     logger.info(f"Stord inventory for SKU {sku} not found in API response.")
@@ -287,36 +301,52 @@ class StordService:
         
         return await asyncio.to_thread(_fetch)
 
+if __name__ == "__main__":
+    # Example usage
+    stord_service = StordService()
+    orders = stord_service.get_sales_orders(limit=10)
+    if orders:
+        print(f"Fetched {len(orders)} orders. First order: {json.dumps(orders[0], indent=2)}")
+
+    # Example of fetching a single sales order
+    test_order_number = "SO-000-000-000" # Replace with a real order number for testing
+    try:
+        order_detail = stord_service.get_sales_order_by_number(test_order_number)
+        if order_detail:
+            print(f"Fetched Stord Order {test_order_number}: {json.dumps(order_detail, indent=2)}")
+        else:
+            print(f"Stord Order {test_order_number} not found.")
+    except Exception as e:
+        print(f"Error during test fetch for Stord Order {test_order_number}: {e}")
+
 
 if __name__ == "__main__":
     stord_service = StordService()
-    # Example usage: fetching sales orders (without saving to file)
     sales_orders = stord_service.get_sales_orders(
-        single_page=True, # Fetch only one page for quick test
-        limit=10,
+        single_page=False,
+        limit=100,
         channel_ids=STORD_CHANNEL_IDS,
         status=STORD_STATUS,
-        output_format=None,
         fields=["order_number", "status", "sales_order_lines"],
     )
-    print(f"Fetched {len(sales_orders)} sample sales orders.")
+    # print(f"Fetched {len(sales_orders)} sample sales orders.")
 
-    # Example usage: fetching a single order by ID
-    # Replace with a real Stord Order ID for testing
-    test_order_id = "a_stord_order_id_for_testing"
-    try:
-        order_detail = stord_service.get_order_by_id(test_order_id)
-        if order_detail:
-            print(f"Fetched Stord Order {test_order_id}: {json.dumps(order_detail, indent=2)}")
-        else:
-            print(f"Stord Order {test_order_id} not found.")
-    except Exception as e:
-        print(f"Error during test fetch for Stord Order {test_order_id}: {e}")
+    # # Example usage: fetching a single order by ID
+    # # Replace with a real Stord Order ID for testing
+    # test_order_id = "a_stord_order_id_for_testing"
+    # try:
+    #     order_detail = stord_service.get_order_by_id(test_order_id)
+    #     if order_detail:
+    #         print(f"Fetched Stord Order {test_order_id}: {json.dumps(order_detail, indent=2)}")
+    #     else:
+    #         print(f"Stord Order {test_order_id} not found.")
+    # except Exception as e:
+    #     print(f"Error during test fetch for Stord Order {test_order_id}: {e}")
 
-    # Example usage: fetching inventory by SKU
-    test_sku = "TCT4000SEABRZXL" # Replace with a real SKU for testing
-    try:
-        inventory = stord_service.get_inventory_from_stord_api(test_sku)
-        print(f"Stord Inventory for SKU {test_sku}: {inventory}")
-    except Exception as e:
-        print(f"Error during test fetch for Stord Inventory {test_sku}: {e}")
+    # # Example usage: fetching inventory by SKU
+    # test_sku = "TCT4000SEABRZXL" # Replace with a real SKU for testing
+    # try:
+    #     inventory = stord_service.get_inventory_from_stord_api(test_sku)
+    #     print(f"Stord Inventory for SKU {test_sku}: {inventory}")
+    # except Exception as e:
+    #     print(f"Error during test fetch for Stord Inventory {test_sku}: {e}")

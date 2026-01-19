@@ -37,16 +37,22 @@ class BigQueryService:
         
         # Schemas for raw flattened JSON tables
         self._stord_details_schema = [
-            bigquery.SchemaField("order_number", "STRING", mode="REQUIRED"), # Stord primary ID
-            bigquery.SchemaField("raw_json", "JSON", mode="REQUIRED"),
+            bigquery.SchemaField("order_number", "STRING", mode="REQUIRED"),  # Stord primary ID
+            bigquery.SchemaField("raw_json", "JSON", mode="NULLABLE"),
             bigquery.SchemaField("source", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("last_updated_at", "TIMESTAMP"),
+            bigquery.SchemaField("first_seen_timestamp", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("last_seen_timestamp", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("is_currently_in_exception", "BOOLEAN", mode="REQUIRED"),
+            bigquery.SchemaField("resolved_timestamp", "TIMESTAMP", mode="NULLABLE"),
         ]
         self._shipbob_details_schema = [
-            bigquery.SchemaField("id", "STRING", mode="REQUIRED"), # Shipbob primary ID
-            bigquery.SchemaField("raw_json", "JSON", mode="REQUIRED"),
+            bigquery.SchemaField("id", "STRING", mode="REQUIRED"),  # Shipbob primary ID
+            bigquery.SchemaField("raw_json", "JSON", mode="NULLABLE"),
             bigquery.SchemaField("source", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("last_updated_at", "TIMESTAMP"),
+            bigquery.SchemaField("first_seen_timestamp", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("last_seen_timestamp", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("is_currently_in_exception", "BOOLEAN", mode="REQUIRED"),
+            bigquery.SchemaField("resolved_timestamp", "TIMESTAMP", mode="NULLABLE"),
         ]
 
     @property
@@ -141,58 +147,116 @@ class BigQueryService:
             logger.info(f"Table '{table_id}' created.")
 
     def sync_raw_order_data(
-        self, 
+        self,
         source: str,
-        raw_orders_data: List[Dict[str, Any]], # Now accepts raw dicts
+        raw_orders_data: List[Dict[str, Any]],
         timestamp: datetime
     ):
-        logger.info(f"Starting BigQuery data sync for source: {source}")
+        logger.info(f"Starting BigQuery MERGE sync for source: {source}")
 
-        target_table_id = ""
         if source == "stord":
             target_table_id = self.stord_details_table_id
-            # For Stord, use 'order_number' as the primary ID field for BigQuery operations
             id_field = "order_number"
+            schema = self._stord_details_schema
         elif source == "shipbob":
             target_table_id = self.shipbob_details_table_id
-            # For Shipbob, use 'id' as the primary ID field for BigQuery operations
             id_field = "id"
+            schema = self._shipbob_details_schema
         else:
             raise ValueError(f"Invalid source: {source}")
 
-        rows_to_load = []
-        for order_data in raw_orders_data:
-            # Extract the ID based on the source's primary ID field
-            order_id_value = str(order_data.get(id_field))
-            if not order_id_value:
-                logger.warning(f"Skipping order due to missing {id_field} for source {source}: {order_data}")
-                continue
+        # Staging table for the current batch of data
+        staging_table_id = f"{self.project_id}.{self.dataset_id}.staging_{source}_{timestamp.strftime('%Y%m%d%H%M%S')}"
+        
+        try:
+            # 1. Prepare and load data into a temporary staging table
+            if raw_orders_data:
+                rows_to_load = []
+                for order_data in raw_orders_data:
+                    order_id_value = str(order_data.get(id_field))
+                    if not order_id_value:
+                        logger.warning(f"Skipping order due to missing {id_field} for source {source}: {order_data}")
+                        continue
+                    rows_to_load.append({
+                        id_field: order_id_value,
+                        "raw_json": json.dumps(order_data),
+                    })
+                
+                if not rows_to_load:
+                    logger.info(f"No valid rows to load for source {source}. Processing potential resolutions.")
+                else:
+                    # Create a simple schema for the staging table
+                    staging_schema = [
+                        bigquery.SchemaField(id_field, "STRING", mode="REQUIRED"),
+                        bigquery.SchemaField("raw_json", "JSON", mode="REQUIRED"),
+                    ]
+                    staging_table = bigquery.Table(staging_table_id, schema=staging_schema)
+                    self.client.create_table(staging_table)
+                    logger.info(f"Created staging table {staging_table_id}")
 
-            rows_to_load.append({
-                id_field: order_id_value, # Use source-specific ID field
-                "raw_json": json.dumps(order_data), # Store the entire raw order as JSON string
-                "source": source,
-                "last_updated_at": timestamp.isoformat()
-            })
+                    job_config = bigquery.LoadJobConfig(
+                        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+                        autodetect=False,
+                        schema=staging_schema
+                    )
+                    load_job = self.client.load_table_from_json(rows_to_load, staging_table_id, job_config=job_config)
+                    load_job.result()
+                    logger.info(f"Loaded {len(rows_to_load)} rows into staging table {staging_table_id}")
+            else:
+                logger.info(f"No raw order data provided for source {source}. The MERGE will treat all existing exceptions as resolved.")
 
-        if rows_to_load:
-            delete_job = self.client.query(f"DELETE FROM `{target_table_id}` WHERE source = '{source}'")
-            delete_job.result() 
-            logger.info(f"Deleted existing data for source: {source} in {target_table_id}")
+            # 2. Execute the MERGE statement
+            merge_sql = f"""
+            MERGE `{target_table_id}` AS T
+            USING `{staging_table_id if raw_orders_data else "(SELECT 1 AS _ WHERE 1=0)"}` AS S
+            ON T.{id_field} = S.{id_field} AND T.source = @source
 
-            job_config = bigquery.LoadJobConfig(
-                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-                autodetect=False,
-                schema=self._stord_details_schema if source == "stord" else self._shipbob_details_schema
+            -- Case 1: New exception order. INSERT it.
+            WHEN NOT MATCHED BY TARGET THEN
+              INSERT (
+                  {id_field}, raw_json, source, first_seen_timestamp, 
+                  last_seen_timestamp, is_currently_in_exception, resolved_timestamp
+              )
+              VALUES (
+                  S.{id_field}, S.raw_json, @source, @timestamp, 
+                  @timestamp, TRUE, NULL
+              )
+
+            -- Case 2: Order is still in exception. Update it.
+            -- Also handles cases where a resolved order reappears in exceptions.
+            WHEN MATCHED THEN
+              UPDATE SET
+                T.raw_json = S.raw_json,
+                T.last_seen_timestamp = @timestamp,
+                T.is_currently_in_exception = TRUE,
+                T.resolved_timestamp = NULL
+
+            -- Case 3: Order is no longer in the exception source data. Mark it as resolved.
+            -- It only marks currently active exceptions as resolved.
+            WHEN NOT MATCHED BY SOURCE AND T.is_currently_in_exception = TRUE AND T.source = @source THEN
+              UPDATE SET
+                T.is_currently_in_exception = FALSE,
+                T.resolved_timestamp = @timestamp,
+                T.raw_json = NULL
+            """
+
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("source", "STRING", source),
+                    bigquery.ScalarQueryParameter("timestamp", "TIMESTAMP", timestamp),
+                ]
             )
-            load_job = self.client.load_table_from_json(rows_to_load, target_table_id, job_config=job_config)
-            load_job.result() 
-            logger.info(f"Successfully loaded {len(rows_to_load)} raw order rows for {source} into {target_table_id}.")
-        else:
-            logger.info(f"No raw order rows to load for {source}.")
-            delete_job = self.client.query(f"DELETE FROM `{target_table_id}` WHERE source = '{source}'")
-            delete_job.result()
-            logger.info(f"Cleared existing data for {source} (no new data to load) in {target_table_id}.")
+            
+            logger.info("Executing MERGE statement...")
+            merge_job = self.client.query(merge_sql, job_config=job_config)
+            merge_job.result()
+            logger.info(f"MERGE statement completed successfully for source: {source}")
+
+        finally:
+            # 3. Drop the staging table
+            if raw_orders_data:
+                self.client.delete_table(staging_table_id, not_found_ok=True)
+                logger.info(f"Dropped staging table {staging_table_id}")
 
     def get_oos_orders(self, source: str) -> List[Dict[str, Any]]:
         try:
@@ -207,7 +271,7 @@ class BigQueryService:
             if not target_table_id:
                 raise BigQueryClientError("BigQuery is not configured. GOOGLE_CLOUD_PROJECT is not set.")
 
-            query = f"SELECT raw_json FROM `{target_table_id}` WHERE source = @source ORDER BY last_updated_at DESC"
+            query = f"SELECT raw_json FROM `{target_table_id}` WHERE source = @source AND is_currently_in_exception = TRUE ORDER BY last_seen_timestamp DESC"
             job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("source", "STRING", source)])
             query_job = self.client.query(query, job_config=job_config)
             
@@ -265,11 +329,11 @@ class BigQueryService:
                 raise BigQueryClientError("BigQuery is not configured. GOOGLE_CLOUD_PROJECT is not set.")
 
             query = f"""
-                SELECT MAX(last_updated_at) as last_refresh_time
+                SELECT MAX(last_seen_timestamp) as last_refresh_time
                 FROM (
-                    SELECT last_updated_at FROM `{self.stord_details_table_id}`
+                    SELECT last_seen_timestamp FROM `{self.stord_details_table_id}`
                     UNION ALL
-                    SELECT last_updated_at FROM `{self.shipbob_details_table_id}`
+                    SELECT last_seen_timestamp FROM `{self.shipbob_details_table_id}`
                 )
             """
             query_job = self.client.query(query)
