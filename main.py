@@ -63,6 +63,7 @@ origins = [
     "http://localhost:3000",
     "http://100.108.61.13:3000",
     "http://100.108.61.13",
+    "https://oos-webapp-fe-999385730987.us-west2.run.app",
 ]
 app.add_middleware(
     CORSMiddleware,
