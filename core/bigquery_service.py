@@ -236,8 +236,7 @@ class BigQueryService:
             WHEN NOT MATCHED BY SOURCE AND T.is_currently_in_exception = TRUE AND T.source = @source THEN
               UPDATE SET
                 T.is_currently_in_exception = FALSE,
-                T.resolved_timestamp = @timestamp,
-                T.raw_json = NULL
+                T.resolved_timestamp = @timestamp
             """
 
             job_config = bigquery.QueryJobConfig(
@@ -284,6 +283,45 @@ class BigQueryService:
         except Exception as e:
             logger.error(f"Error fetching OOS orders from BigQuery: {e}")
             raise BigQueryClientError(f"Failed to fetch orders from BigQuery: {e}") from e
+
+    def get_historical_oos_orders_by_date(self, start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
+        """
+        Retrieves all orders that first went into an OOS state within the given date range,
+        including those that have since been resolved.
+        """
+        try:
+            if not self.stord_details_table_id or not self.shipbob_details_table_id:
+                raise BigQueryClientError("BigQuery is not configured. GOOGLE_CLOUD_PROJECT is not set.")
+
+            query = f"""
+                SELECT raw_json
+                FROM (
+                    SELECT raw_json, first_seen_timestamp, is_currently_in_exception, resolved_timestamp FROM `{self.stord_details_table_id}`
+                    UNION ALL
+                    SELECT raw_json, first_seen_timestamp, is_currently_in_exception, resolved_timestamp FROM `{self.shipbob_details_table_id}`
+                )
+                WHERE 
+                    (is_currently_in_exception = TRUE OR resolved_timestamp IS NOT NULL)
+                    AND first_seen_timestamp BETWEEN @start_date AND @end_date
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("start_date", "TIMESTAMP", start_date),
+                    bigquery.ScalarQueryParameter("end_date", "TIMESTAMP", end_date),
+                ]
+            )
+            query_job = self.client.query(query, job_config=job_config)
+            
+            results = []
+            for row in query_job.result():
+                if row.raw_json:
+                    results.append(json.loads(row.raw_json))
+            return results
+        except BigQueryClientError:
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching historical OOS orders from BigQuery: {e}")
+            raise BigQueryClientError(f"Failed to fetch historical orders from BigQuery: {e}") from e
 
     def get_order_details(self, order_id: str, source: str) -> Optional[Dict[str, Any]]:
         try:

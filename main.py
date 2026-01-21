@@ -28,6 +28,7 @@ from core.data_models import (
 )  # Added SkuInventory
 from core.stord_service import StordService  # Added StordService
 from core.shipbob_service import ShipbobService  # Added ShipbobService
+from core.analytics_service import analytics_service
 
 logger = get_logger(__name__)
 
@@ -327,6 +328,72 @@ async def get_last_refresh_time(
         raise HTTPException(
             status_code=503,
             detail=f"BigQuery service unavailable: {str(e)}. Please check your BigQuery credentials configuration.",
+        )
+
+
+from core.analytics_service import analytics_service
+from datetime import datetime, timedelta, timezone
+
+@app.get("/api/analytics/summary", status_code=status.HTTP_200_OK)
+@limiter.limit("30/minute")
+async def get_analytics_summary(
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(verify_credentials),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    """
+    Retrieves a consolidated summary of historical OOS analytics for a given date range.
+    Defaults to the current month if no date range is provided.
+    """
+    try:
+        # Determine date range, making them timezone-aware (UTC)
+        now_utc = datetime.now(timezone.utc)
+        if start_date:
+            # Parse date string and set to the beginning of the day in UTC
+            start_dt = datetime.fromisoformat(start_date).replace(
+                hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+            )
+        else:
+            # Default to the beginning of the current month in UTC
+            start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        if end_date:
+            # Parse date string and set to the end of the day in UTC
+            end_dt = datetime.fromisoformat(end_date).replace(
+                hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+            )
+        else:
+            # Default to the current time in UTC
+            end_dt = now_utc
+
+        # Call the single, consolidated BigQuery analytics method
+        analytics_data = analytics_service.get_full_analytics(start_dt, end_dt)
+
+        # The data is already in the correct format, just add the metadata
+        analytics_data["last_updated"] = now_utc.isoformat()
+        analytics_data["date_range"] = {
+            "start_date": start_dt.isoformat(),
+            "end_date": end_dt.isoformat(),
+        }
+        
+        return analytics_data
+
+    except BigQueryClientError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"BigQuery service unavailable: {str(e)}",
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date format. Please use ISO 8601 format (YYYY-MM-DD).",
+        )
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in get_analytics_summary: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while generating analytics.",
         )
 
 
