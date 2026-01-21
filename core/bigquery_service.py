@@ -208,7 +208,7 @@ class BigQueryService:
             # 2. Execute the MERGE statement
             merge_sql = f"""
             MERGE `{target_table_id}` AS T
-            USING `{staging_table_id if raw_orders_data else "(SELECT 1 AS _ WHERE 1=0)"}` AS S
+            USING `{staging_table_id if raw_orders_data else f"(SELECT * FROM `{target_table_id}` WHERE 1=0)"}` AS S
             ON T.{id_field} = S.{id_field} AND T.source = @source
 
             -- Case 1: New exception order. INSERT it.
