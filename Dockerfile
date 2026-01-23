@@ -14,8 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose the port that FastAPI will run on
-EXPOSE 8000
+EXPOSE 8080
 
 # Run the FastAPI application using Gunicorn with Uvicorn workers
 # This is a more robust setup for production than running uvicorn directly.
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--worker-class", "uvicorn.workers.UvicornWorker", "main:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--worker-class", "uvicorn.workers.UvicornWorker", "main:app"]
