@@ -12,6 +12,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
 import json
 import asyncio
+import os
 
 from core.logger import get_logger
 from core.bigquery_service import bigquery_service, BigQueryClientError
@@ -69,14 +70,30 @@ app.add_exception_handler(
     ),
 )
 
+# Add a middleware to log requests for debugging in GCR
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Incoming request: {request.method} {request.url}")
+    logger.info(f"Request Headers: {request.headers}")
+    response = await call_next(request)
+    return response
+
 # CORS configuration
 origins = [
+    # Local development origins
     "http://localhost",
     "http://localhost:3000",
     "http://100.108.61.13:3000",
     "http://100.108.61.13",
+    # Hardcoded production origin (for existing deployments)
     "https://oos-webapp-fe-999385730987.us-west2.run.app",
 ]
+
+# Add the frontend URL from environment variables for deployed environments
+cors_origin = os.getenv("CORS_ORIGIN")
+if cors_origin:
+    origins.append(cors_origin)
+    logger.info(f"Allowing CORS for origin: {cors_origin}")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
