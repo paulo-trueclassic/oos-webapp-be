@@ -13,6 +13,7 @@ from core.config import (
     BIGQUERY_STORD_DETAILS_TABLE,
     BIGQUERY_SHIPBOB_DETAILS_TABLE,
 )
+from core.auth_config import BIGQUERY_USERS_TABLE
 
 logger = get_logger(__name__)
 
@@ -31,10 +32,12 @@ class BigQueryService:
             logger.warning("GOOGLE_CLOUD_PROJECT environment variable is not set. BigQuery operations will fail.")
             self.stord_details_table_id = None
             self.shipbob_details_table_id = None
+            self.users_table_id = None
         else:
             self.stord_details_table_id = f"{self.project_id}.{self.dataset_id}.{BIGQUERY_STORD_DETAILS_TABLE}"
             self.shipbob_details_table_id = f"{self.project_id}.{self.dataset_id}.{BIGQUERY_SHIPBOB_DETAILS_TABLE}"
-        
+            self.users_table_id = f"{self.project_id}.{self.dataset_id}.{BIGQUERY_USERS_TABLE}"
+
         # Schemas for raw flattened JSON tables
         self._stord_details_schema = [
             bigquery.SchemaField("order_number", "STRING", mode="REQUIRED"),  # Stord primary ID
@@ -53,6 +56,11 @@ class BigQueryService:
             bigquery.SchemaField("last_seen_timestamp", "TIMESTAMP", mode="REQUIRED"),
             bigquery.SchemaField("is_currently_in_exception", "BOOLEAN", mode="REQUIRED"),
             bigquery.SchemaField("resolved_timestamp", "TIMESTAMP", mode="NULLABLE"),
+        ]
+        self._users_schema = [
+            bigquery.SchemaField("username", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("hashed_password", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("role", "STRING", mode="REQUIRED"), # e.g., 'admin', 'user'
         ]
 
     @property
@@ -132,9 +140,10 @@ class BigQueryService:
             self.client.create_dataset(dataset)
             logger.info(f"Dataset '{self.dataset_id}' created.")
 
-        # Create both Stord and Shipbob details tables
+        # Create Stord, Shipbob, and User tables
         self._create_table_if_not_exists(self.stord_details_table_id, self._stord_details_schema)
         self._create_table_if_not_exists(self.shipbob_details_table_id, self._shipbob_details_schema)
+        self._create_table_if_not_exists(self.users_table_id, self._users_schema)
 
     def _create_table_if_not_exists(self, table_id: str, schema: List[bigquery.SchemaField]):
         try:

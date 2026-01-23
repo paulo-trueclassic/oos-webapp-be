@@ -8,16 +8,12 @@ from fastapi import (
     Response,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
-import base64
-import asyncio  # Added for concurrent API calls
+import asyncio
 
 from core.logger import get_logger
-from core.config import APP_USERNAME, APP_PASSWORD
 from core.bigquery_service import bigquery_service, BigQueryClientError
 from core.background_tasks import trigger_full_refresh, trigger_source_refresh
 from core.data_models import (
@@ -25,10 +21,12 @@ from core.data_models import (
     convert_stord_order_to_model,
     convert_shipbob_order_to_model,
     SkuInventory,
-)  # Added SkuInventory
-from core.stord_service import StordService  # Added StordService
-from core.shipbob_service import ShipbobService  # Added ShipbobService
+)
+from core.stord_service import StordService
+from core.shipbob_service import ShipbobService
 from core.analytics_service import analytics_service
+from core.security import get_current_user, User
+from routers import auth as auth_router, users as users_router
 
 logger = get_logger(__name__)
 
@@ -37,6 +35,20 @@ app = FastAPI(
     description="API for processing and serving out-of-stock order data",
     version="1.0.0",
 )
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    On startup, check if the required BigQuery tables exist and create them if they don't.
+    """
+    try:
+        logger.info("Application startup: Verifying BigQuery tables...")
+        bigquery_service.create_tables_if_not_exists()
+        logger.info("BigQuery table verification complete.")
+    except BigQueryClientError as e:
+        logger.error(f"FATAL: Could not connect to BigQuery on startup: {e}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during startup: {e}")
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -73,85 +85,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Basic authentication
-security = HTTPBasic()
-
-
-# Login request model for JSON body authentication
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
-    # Check if credentials are configured
-    if not APP_USERNAME or not APP_PASSWORD:
-        logger.error(
-            "APP_USERNAME or APP_PASSWORD not configured in environment variables"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Authentication not configured",
-        )
-
-    # Log received credentials (username only for security)
-    logger.info(f"Authentication attempt for username: {credentials.username}")
-
-    # Compare credentials (case-sensitive)
-    if credentials.username != APP_USERNAME or credentials.password != APP_PASSWORD:
-        logger.warning(f"Authentication failed for username: {credentials.username}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-    logger.info(f"Authentication successful for username: {credentials.username}")
-    return credentials
-
-
-def verify_credentials_from_json(username: str, password: str):
-    """Helper function to verify credentials from JSON body"""
-    # Check if credentials are configured
-    if not APP_USERNAME or not APP_PASSWORD:
-        logger.error(
-            "APP_USERNAME or APP_PASSWORD not configured in environment variables"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Authentication not configured",
-        )
-
-    # Log received credentials (username only for security)
-    logger.info(f"Authentication attempt for username: {username}")
-
-    # Compare credentials (case-sensitive)
-    if username != APP_USERNAME or password != APP_PASSWORD:
-        logger.warning(f"Authentication failed for username: {username}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-        )
-
-    logger.info(f"Authentication successful for username: {username}")
-    return {"username": username}
-
-
-async def get_optional_basic_auth(request: Request) -> Optional[HTTPBasicCredentials]:
-    """Try to get Basic Auth credentials from header, return None if not present"""
-    authorization = request.headers.get("Authorization")
-    if not authorization or not authorization.startswith("Basic "):
-        return None
-
-    try:
-        import base64
-
-        credentials = authorization.replace("Basic ", "")
-        decoded = base64.b64decode(credentials).decode("utf-8")
-        username, password = decoded.split(":", 1)
-        return HTTPBasicCredentials(username=username, password=password)
-    except Exception:
-        return None
+# --- Include Routers ---
+app.include_router(auth_router.router)
+app.include_router(users_router.router)
 
 
 @app.get("/")
@@ -159,13 +95,8 @@ async def root():
     return {
         "message": "OOS Workflow API",
         "version": "1.0.0",
-        "endpoints": {
-            "health": "/health",
-            "oos_orders": "/api/{source}/oos-orders",
-            "order_details": "/api/{source}/order-details/{order_id}",
-            "trigger_refresh": "/api/trigger-refresh (POST)",
-            "token": "/token (POST)",
-        },
+        "docs": "/docs",
+        "redoc": "/redoc",
     }
 
 
@@ -174,31 +105,12 @@ async def health():
     return {"status": "healthy"}
 
 
-@app.post("/token")
-@limiter.limit("100/minute")
-async def login(request: Request, login_data: LoginRequest, response: Response):
-    """
-    Login endpoint that accepts credentials via a JSON body.
-    """
-    verify_credentials_from_json(login_data.username, login_data.password)
-
-    # Create the Basic Auth header value
-    auth_string = f"{login_data.username}:{login_data.password}"
-    encoded_auth_string = base64.b64encode(auth_string.encode("utf-8")).decode("utf-8")
-    auth_header = f"Basic {encoded_auth_string}"
-
-    # Set the header on the response
-    response.headers["Authorization"] = auth_header
-
-    return {"message": "Login successful", "username": login_data.username}
-
-
 @app.get("/api/{source}/oos-orders", response_model=List[OrderDetails])
 @limiter.limit("100/minute")
 async def get_oos_orders(
     request: Request,
     source: str,
-    credentials: HTTPBasicCredentials = Depends(verify_credentials),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Retrieves a list of all out-of-stock orders for the given source from BigQuery.
@@ -217,33 +129,26 @@ async def get_oos_orders(
             detail=f"BigQuery service unavailable: {str(e)}. Please check your BigQuery credentials configuration.",
         )
 
-    # Convert raw data to OrderDetails models for consistent frontend consumption
     converted_orders = []
     for item in raw_orders_data:
         if source.lower() == "stord":
-            # The conversion function now returns a list, so we extend the main list
             converted_orders.extend(
                 convert_stord_order_to_model(item, include_raw=True)
             )
-        else:  # shipbob
-            # The conversion function now returns a list, so we extend the main list
+        else:
             converted_orders.extend(
                 convert_shipbob_order_to_model(item, include_raw=True)
             )
-
     return converted_orders
 
 
-@app.get(
-    "/api/{source}/order-details/{order_id}", response_model=Optional[OrderDetails]
-)
+@app.get("/api/{source}/order-details/{order_id}", response_model=Optional[OrderDetails])
 @limiter.limit("100/minute")
 async def get_order_details(
     request: Request,
-    _details: Optional[bool],
     order_id: str,
     source: str,
-    credentials: HTTPBasicCredentials = Depends(verify_credentials),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Retrieves full order details for a specific order_id and source from BigQuery.
@@ -261,7 +166,7 @@ async def get_order_details(
     except BigQueryClientError as e:
         raise HTTPException(
             status_code=503,
-            detail=f"BigQuery service unavailable: {str(e)}. Please check your BigQuery credentials configuration.",
+            detail=f"BigQuery service unavailable: {str(e)}.",
         )
 
     if not raw_order_data:
@@ -269,52 +174,51 @@ async def get_order_details(
             status_code=404, detail=f"Order {order_id} from {source} not found."
         )
 
-    # Convert raw data to OrderDetails model for consistent frontend consumption
     if source.lower() == "stord":
-        return convert_stord_order_to_model(raw_order_data, include_raw=True)
-    else:  # shipbob
-        return convert_shipbob_order_to_model(raw_order_data, include_raw=True)
+        return convert_stord_order_to_model(raw_order_data, include_raw=True)[0]
+    else:
+        return convert_shipbob_order_to_model(raw_order_data, include_raw=True)[0]
 
 
 @app.post("/api/trigger-refresh", status_code=status.HTTP_202_ACCEPTED)
-@limiter.limit("100/minute")
+@limiter.limit("10/minute")
 async def trigger_full_refresh_endpoint(
     request: Request,
     background_tasks: BackgroundTasks,
-    credentials: HTTPBasicCredentials = Depends(verify_credentials),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Triggers a full refresh of Stord and Shipbob OOS data in the background.
     """
     background_tasks.add_task(trigger_full_refresh)
-    logger.info("Full data refresh task added to background.")
+    logger.info(f"User '{current_user.username}' triggered a full data refresh.")
     return {"message": "Full data refresh initiated in the background."}
 
 
 @app.post("/api/trigger-refresh/{source}", status_code=status.HTTP_202_ACCEPTED)
-@limiter.limit("100/minute")
+@limiter.limit("10/minute")
 async def trigger_source_refresh_endpoint(
     request: Request,
     source: str,
     background_tasks: BackgroundTasks,
-    credentials: HTTPBasicCredentials = Depends(verify_credentials),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Triggers a refresh of OOS data for a single source ('stord' or 'shipbob') in the background.
     """
     source = source.lower()
     if source not in ["stord", "shipbob"]:
-        raise HTTPException(status_code=400, detail="Invalid source specified. Must be 'stord' or 'shipbob'.")
+        raise HTTPException(status_code=400, detail="Invalid source specified.")
     
     background_tasks.add_task(trigger_source_refresh, source)
-    logger.info(f"Data refresh task for source '{source}' added to background.")
+    logger.info(f"User '{current_user.username}' triggered a data refresh for source '{source}'.")
     return {"message": f"Data refresh for source '{source}' initiated in the background."}
 
 
 @app.get("/api/last-refresh-time")
 @limiter.limit("100/minute")
 async def get_last_refresh_time(
-    request: Request, credentials: HTTPBasicCredentials = Depends(verify_credentials)
+    request: Request, current_user: User = Depends(get_current_user)
 ):
     """
     Retrieves the most recent timestamp of a data refresh.
@@ -328,89 +232,63 @@ async def get_last_refresh_time(
     except BigQueryClientError as e:
         raise HTTPException(
             status_code=503,
-            detail=f"BigQuery service unavailable: {str(e)}. Please check your BigQuery credentials configuration.",
+            detail=f"BigQuery service unavailable: {str(e)}.",
         )
-
-
-from core.analytics_service import analytics_service
-from datetime import datetime, timedelta, timezone
 
 @app.get("/api/analytics/summary", status_code=status.HTTP_200_OK)
 @limiter.limit("30/minute")
 async def get_analytics_summary(
     request: Request,
-    credentials: HTTPBasicCredentials = Depends(verify_credentials),
+    current_user: User = Depends(get_current_user),
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ):
     """
     Retrieves a consolidated summary of historical OOS analytics for a given date range.
-    Defaults to the current month if no date range is provided.
     """
     try:
-        # Determine date range, making them timezone-aware (UTC)
         now_utc = datetime.now(timezone.utc)
         if start_date:
-            # Parse date string and set to the beginning of the day in UTC
             start_dt = datetime.fromisoformat(start_date).replace(
                 hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
             )
         else:
-            # Default to the beginning of the current month in UTC
             start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
         if end_date:
-            # Parse date string and set to the end of the day in UTC
             end_dt = datetime.fromisoformat(end_date).replace(
                 hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
             )
         else:
-            # Default to the current time in UTC
             end_dt = now_utc
 
-        # Call the single, consolidated BigQuery analytics method
         analytics_data = analytics_service.get_full_analytics(start_dt, end_dt)
-
-        # The data is already in the correct format, just add the metadata
         analytics_data["last_updated"] = now_utc.isoformat()
         analytics_data["date_range"] = {
             "start_date": start_dt.isoformat(),
             "end_date": end_dt.isoformat(),
         }
-        
         return analytics_data
-
     except BigQueryClientError as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"BigQuery service unavailable: {str(e)}",
-        )
+        raise HTTPException(status_code=503, detail=f"BigQuery service unavailable: {str(e)}")
     except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid date format. Please use ISO 8601 format (YYYY-MM-DD).",
-        )
+        raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
     except Exception as e:
         logger.error(f"An unexpected error occurred in get_analytics_summary: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="An internal error occurred while generating analytics.",
-        )
+        raise HTTPException(status_code=500, detail="An internal error occurred.")
 
 
 @app.post("/api/inventory/bulk", response_model=Dict[str, SkuInventory])
 @limiter.limit("100/minute")
 async def get_bulk_inventory(
-    request: Request, credentials: HTTPBasicCredentials = Depends(verify_credentials)
+    request: Request, current_user: User = Depends(get_current_user)
 ):
     """
-    Fetches live inventory data for a list of SKUs from Stord and Shipbob APIs concurrently,
-    processing in batches to respect API rate limits.
+    Fetches live inventory data for a list of SKUs from Stord and Shipbob APIs concurrently.
     """
     try:
         request_body = await request.json()
-        skus = list(set(request_body.get("skus", [])))  # Deduplicate SKUs
-        logger.info(f"--- INVENTORY DEBUG: Received {len(skus)} SKUs for bulk inventory check ---")
+        skus = list(set(request_body.get("skus", [])))
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
@@ -418,24 +296,20 @@ async def get_bulk_inventory(
         return {}
 
     inventory_results = {}
-    batch_size = 100  # Process 100 SKUs at a time (200 total API calls)
+    batch_size = 100
     
     for i in range(0, len(skus), batch_size):
         batch_skus = skus[i:i + batch_size]
         logger.info(f"Processing inventory batch {i//batch_size + 1} with {len(batch_skus)} SKUs.")
         
-        tasks = []
-        for sku in batch_skus:
-            tasks.append(stord_service.get_inventory_from_stord_api(sku))
-            tasks.append(shipbob_service.get_inventory_from_shipbob_api(sku))
+        tasks = [stord_service.get_inventory_from_stord_api(sku) for sku in batch_skus]
+        tasks += [shipbob_service.get_inventory_from_shipbob_api(sku) for sku in batch_skus]
 
-        # Run all API calls for the current batch concurrently
         batch_api_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results and group them by SKU
         for j, sku in enumerate(batch_skus):
-            stord_result = batch_api_results[j*2]
-            shipbob_result = batch_api_results[j*2+1]
+            stord_result = batch_api_results[j]
+            shipbob_result = batch_api_results[j + len(batch_skus)]
 
             stord_stock = stord_result if not isinstance(stord_result, Exception) else 0
             if isinstance(stord_result, Exception):
@@ -445,17 +319,15 @@ async def get_bulk_inventory(
             if isinstance(shipbob_result, Exception):
                 logger.error(f"Error fetching Shipbob inventory for SKU {sku}: {shipbob_result}")
 
-            current_sku_normalized = sku.strip().lower()
-            inventory_results[current_sku_normalized] = SkuInventory(
+            inventory_results[sku.strip().lower()] = SkuInventory(
                 sku=sku,
                 stord_stock=stord_stock,
                 shipbob_fontana_stock=shipbob_fontana_stock,
                 shipbob_other_stock=shipbob_other_stock
             )
             
-        # If there are more batches to process, wait for 60 seconds before the next one
         if i + batch_size < len(skus):
-            logger.info(f"Batch {i//batch_size + 1} complete. Waiting 60 seconds to respect rate limits.")
+            logger.info(f"Batch {i//batch_size + 1} complete. Waiting 60 seconds.")
             await asyncio.sleep(60)
 
     logger.info("All inventory batches processed successfully.")
@@ -466,5 +338,5 @@ if __name__ == "__main__":
     import os
     import uvicorn
 
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
