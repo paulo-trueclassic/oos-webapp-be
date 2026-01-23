@@ -16,6 +16,8 @@ COPY . .
 # Expose the port that FastAPI will run on
 EXPOSE 8080
 
-# Run the FastAPI application using Gunicorn with Uvicorn workers
-# This is a more robust setup for production than running uvicorn directly.
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--worker-class", "uvicorn.workers.UvicornWorker", "main:app"]
+# Run the FastAPI application using Gunicorn with Uvicorn workers.
+# This command uses the $PORT environment variable, which is required for services
+# like Google Cloud Run. It's written in shell form to allow the shell to
+# substitute the $PORT variable.
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --worker-class "uvicorn.workers.UvicornWorker" main:app
