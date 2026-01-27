@@ -48,5 +48,5 @@ BIGQUERY_SHIPBOB_DETAILS_TABLE = os.getenv("BIGQUERY_SHIPBOB_DETAILS_TABLE", "sh
 # Application Configuration
 # ============================================================================
 ENV = os.getenv("ENV", "").lower()
-APP_USERNAME = os.getenv("APP_USERNAME")
-APP_PASSWORD = os.getenv("APP_PASSWORD")
+TOKEN_VALIDITY = os.getenv("TOKEN_VALIDITY", 1440)
+TOKEN_VALIDITY = int(TOKEN_VALIDITY)
