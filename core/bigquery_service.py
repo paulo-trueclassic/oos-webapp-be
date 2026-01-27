@@ -12,8 +12,11 @@ from core.config import (
     BIGQUERY_DATASET,
     BIGQUERY_STORD_DETAILS_TABLE,
     BIGQUERY_SHIPBOB_DETAILS_TABLE,
+    BIGQUERY_COMMENTS_TABLE,
 )
 from core.auth_config import BIGQUERY_USERS_TABLE
+from core.data_models import CommentRead
+
 
 logger = get_logger(__name__)
 
@@ -33,10 +36,12 @@ class BigQueryService:
             self.stord_details_table_id = None
             self.shipbob_details_table_id = None
             self.users_table_id = None
+            self.comments_table_id = None
         else:
             self.stord_details_table_id = f"{self.project_id}.{self.dataset_id}.{BIGQUERY_STORD_DETAILS_TABLE}"
             self.shipbob_details_table_id = f"{self.project_id}.{self.dataset_id}.{BIGQUERY_SHIPBOB_DETAILS_TABLE}"
             self.users_table_id = f"{self.project_id}.{self.dataset_id}.{BIGQUERY_USERS_TABLE}"
+            self.comments_table_id = f"{self.project_id}.{self.dataset_id}.{BIGQUERY_COMMENTS_TABLE}"
 
         # Schemas for raw flattened JSON tables
         self._stord_details_schema = [
@@ -61,6 +66,14 @@ class BigQueryService:
             bigquery.SchemaField("username", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("hashed_password", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("role", "STRING", mode="REQUIRED"), # e.g., 'admin', 'user'
+        ]
+        self._comments_schema = [
+            bigquery.SchemaField("order_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("sku", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("facility", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("comment", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("author", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
         ]
 
     @property
@@ -144,6 +157,8 @@ class BigQueryService:
         self._create_table_if_not_exists(self.stord_details_table_id, self._stord_details_schema)
         self._create_table_if_not_exists(self.shipbob_details_table_id, self._shipbob_details_schema)
         self._create_table_if_not_exists(self.users_table_id, self._users_schema)
+        self._create_table_if_not_exists(self.comments_table_id, self._comments_schema)
+
 
     def _create_table_if_not_exists(self, table_id: str, schema: List[bigquery.SchemaField]):
         try:
@@ -154,6 +169,65 @@ class BigQueryService:
             table = bigquery.Table(table_id, schema=schema)
             self.client.create_table(table)
             logger.info(f"Table '{table_id}' created.")
+
+    def add_comment_to_bigquery(self, comment_data: CommentRead):
+        """Inserts a new comment into the BigQuery comments table."""
+        try:
+            if not self.comments_table_id:
+                raise BigQueryClientError("BigQuery comments table is not configured.")
+
+            # Convert Pydantic model to a dict for insertion
+            row_to_insert = comment_data.dict()
+            
+            # BigQuery expects datetime objects for TIMESTAMP fields
+            row_to_insert['created_at'] = row_to_insert['created_at'].isoformat()
+
+            errors = self.client.insert_rows_json(self.comments_table_id, [row_to_insert])
+            if errors:
+                logger.error(f"Encountered errors while inserting comment into BigQuery: {errors}")
+                raise BigQueryClientError(f"Failed to insert comment: {errors}")
+            else:
+                logger.info(f"Successfully inserted comment for SKU {comment_data.sku} by {comment_data.author}")
+
+        except BigQueryClientError:
+            raise
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while adding comment to BigQuery: {e}")
+            raise BigQueryClientError(f"An unexpected error occurred: {e}") from e
+
+    def get_comments_from_bigquery(self, order_id: str, sku: str) -> List[CommentRead]:
+        """Retrieves all comments for a given order_id and sku, sorted by creation date."""
+        try:
+            if not self.comments_table_id:
+                raise BigQueryClientError("BigQuery comments table is not configured.")
+
+            query = f"""
+                SELECT order_id, sku, facility, comment, author, created_at
+                FROM `{self.comments_table_id}`
+                WHERE order_id = @order_id AND sku = @sku
+                ORDER BY created_at DESC
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("order_id", "STRING", order_id),
+                    bigquery.ScalarQueryParameter("sku", "STRING", sku),
+                ]
+            )
+
+            query_job = self.client.query(query, job_config=job_config)
+            
+            results = []
+            for row in query_job.result():
+                results.append(CommentRead(**dict(row.items())))
+            
+            logger.info(f"Found {len(results)} comments for order_id={order_id}, sku={sku}")
+            return results
+
+        except BigQueryClientError:
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching comments from BigQuery: {e}")
+            raise BigQueryClientError(f"Failed to fetch comments from BigQuery: {e}") from e
 
     def sync_raw_order_data(
         self,

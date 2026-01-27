@@ -45,6 +45,19 @@ class OrderDetails(BaseModel):
     last_updated_at: Optional[datetime] # Timestamp from BigQuery for summary, or current for live
     # Add other fields as necessary, ensuring they match the converted data structure
 
+class CommentBase(BaseModel):
+    order_id: str
+    sku: str
+    facility: str
+    comment: str
+
+class CommentCreate(CommentBase):
+    pass
+
+class CommentRead(CommentBase):
+    author: str
+    created_at: datetime
+
 # --- Conversion Functions ---
 
 def convert_stord_order_to_model(order_data: Dict[str, Any], include_raw: bool = False) -> List[OrderDetails]:

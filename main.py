@@ -27,7 +27,7 @@ from core.stord_service import StordService
 from core.shipbob_service import ShipbobService
 from core.analytics_service import analytics_service
 from core.security import get_current_user, User
-from routers import auth as auth_router, users as users_router
+from routers import auth as auth_router, users as users_router, comments as comments_router
 
 logger = get_logger(__name__)
 
@@ -105,6 +105,7 @@ app.add_middleware(
 # --- Include Routers ---
 app.include_router(auth_router.router)
 app.include_router(users_router.router)
+app.include_router(comments_router.router, prefix="/api/v1")
 
 
 @app.get("/")
@@ -313,41 +314,39 @@ async def get_bulk_inventory(
         return {}
 
     inventory_results = {}
-    batch_size = 100
-    
-    for i in range(0, len(skus), batch_size):
-        batch_skus = skus[i:i + batch_size]
-        logger.info(f"Processing inventory batch {i//batch_size + 1} with {len(batch_skus)} SKUs.")
+    # Shipbob rate limit is 150 req/min, which is 2.5 req/sec.
+    # To be safe and account for two external calls per SKU (Stord + Shipbob),
+    # introduce a small delay between processing each SKU's external API calls.
+    # A delay of 0.4 seconds per SKU ensures we don't exceed 2.5 req/sec for Shipbob,
+    # and is a conservative approach for Stord.
+
+
+    for sku in skus:
+        stord_result_coro = stord_service.get_inventory_from_stord_api(sku)
+        shipbob_result_coro = shipbob_service.get_inventory_from_shipbob_api(sku)
+
+        stord_result, shipbob_result = await asyncio.gather(
+            stord_result_coro, shipbob_result_coro, return_exceptions=True
+        )
+
+        stord_stock = stord_result if not isinstance(stord_result, Exception) else 0
+        if isinstance(stord_result, Exception):
+            logger.error(f"Error fetching Stord inventory for SKU {sku}: {stord_result}")
+
+        shipbob_fontana_stock, shipbob_other_stock = shipbob_result if not isinstance(shipbob_result, Exception) else (0, 0)
+        if isinstance(shipbob_result, Exception):
+            logger.error(f"Error fetching Shipbob inventory for SKU {sku}: {shipbob_result}")
+
+        inventory_results[sku.strip().lower()] = SkuInventory(
+            sku=sku,
+            stord_stock=stord_stock,
+            shipbob_fontana_stock=shipbob_fontana_stock,
+            shipbob_other_stock=shipbob_other_stock
+        )
         
-        tasks = [stord_service.get_inventory_from_stord_api(sku) for sku in batch_skus]
-        tasks += [shipbob_service.get_inventory_from_shipbob_api(sku) for sku in batch_skus]
 
-        batch_api_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for j, sku in enumerate(batch_skus):
-            stord_result = batch_api_results[j]
-            shipbob_result = batch_api_results[j + len(batch_skus)]
-
-            stord_stock = stord_result if not isinstance(stord_result, Exception) else 0
-            if isinstance(stord_result, Exception):
-                logger.error(f"Error fetching Stord inventory for SKU {sku}: {stord_result}")
-
-            shipbob_fontana_stock, shipbob_other_stock = shipbob_result if not isinstance(shipbob_result, Exception) else (0, 0)
-            if isinstance(shipbob_result, Exception):
-                logger.error(f"Error fetching Shipbob inventory for SKU {sku}: {shipbob_result}")
-
-            inventory_results[sku.strip().lower()] = SkuInventory(
-                sku=sku,
-                stord_stock=stord_stock,
-                shipbob_fontana_stock=shipbob_fontana_stock,
-                shipbob_other_stock=shipbob_other_stock
-            )
-            
-        if i + batch_size < len(skus):
-            logger.info(f"Batch {i//batch_size + 1} complete. Waiting 60 seconds.")
-            await asyncio.sleep(60)
-
-    logger.info("All inventory batches processed successfully.")
+    logger.info("All inventory SKUs processed successfully.")
     return inventory_results
 
 

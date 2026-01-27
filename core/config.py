@@ -43,6 +43,7 @@ GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT") # Added
 BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "oos_reporting")
 BIGQUERY_STORD_DETAILS_TABLE = os.getenv("BIGQUERY_STORD_DETAILS_TABLE", "stord_order_details")
 BIGQUERY_SHIPBOB_DETAILS_TABLE = os.getenv("BIGQUERY_SHIPBOB_DETAILS_TABLE", "shipbob_order_details")
+BIGQUERY_COMMENTS_TABLE = os.getenv("BIGQUERY_COMMENTS_TABLE", "oos_comments")
 
 # ============================================================================
 # Application Configuration
